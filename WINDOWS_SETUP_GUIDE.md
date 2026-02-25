@@ -53,11 +53,11 @@ pip list
 ```
 
 Key packages installed:
-- `streamlit` — Dashboard framework
-- `sqlalchemy`, `pymysql` — Database connectivity
-- `pandas`, `numpy` — Data processing
-- `plotly` — Interactive charts
-- `requests` — FX rate API calls
+- `streamlit`: Dashboard framework
+- `sqlalchemy`, `pymysql`: Database connectivity
+- `pandas`, `numpy`: Data processing
+- `plotly`: Interactive charts
+- `requests`: FX rate API calls
 
 ---
 
