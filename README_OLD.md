@@ -39,7 +39,7 @@ A production-grade procurement intelligence system for manufacturing organizatio
 
 | Layer | Technology |
 |-------|-----------|
-| Database | MySQL 8.0 (`pro_intel_2`) — 19 tables |
+| Database | MySQL 8.0 (`pro_intel_2`) with 19 tables |
 | ORM | SQLAlchemy + PyMySQL |
 | Data Processing | pandas, NumPy |
 | Simulation | NumPy (Geometric Brownian Motion) |
@@ -139,13 +139,13 @@ streamlit run streamlit_app.py
 - The loader validates all inputs before importing
 
 **Required Files:**
-- `suppliers.csv` — supplier details, country, lead times, defect rates
-- `materials.csv` — material name, category, unit cost
-- `purchase_orders.csv` — PO header (date, supplier, amount, currency)
-- `purchase_order_items.csv` — PO line items (quantity, unit price per material)
+- `suppliers.csv`: supplier details, country, lead times, defect rates
+- `materials.csv`: material name, category, unit cost
+- `purchase_orders.csv`: PO header (date, supplier, amount, currency)
+- `purchase_order_items.csv`: PO line items (quantity, unit price per material)
 
 **Optional:**
-- `fx_rates.csv` — historical FX rates (auto-generated if omitted)
+- `fx_rates.csv`: historical FX rates (auto-generated if omitted)
 
 ### Workflow Comparison
 
