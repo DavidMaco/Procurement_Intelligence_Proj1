@@ -2,7 +2,7 @@
   <img src="https://img.icons8.com/fluency/96/prototype.png" alt="Prototype" width="72"/>
 </p>
 
-<h1 align="center">Procurement Intelligence Engine — Prototype</h1>
+<h1 align="center">Procurement Intelligence Engine: Prototype</h1>
 
 <p align="center">
   <em>Rapid prototyping repository for <a href="https://github.com/DavidMaco/pvis"><strong>PVIS</strong></a> (Procurement Volatility Intelligence System)</em>
@@ -35,39 +35,39 @@ This repository served as the **initial proof-of-concept** for the PVIS project.
 
 | Aspect | This Prototype | [PVIS (Production)](https://github.com/DavidMaco/pvis) |
 |:-------|:---------------|:-------|
-| **Status** | Archived — reference only | Active development |
+| **Status** | Archived for reference only | Active development |
 | **Dashboard** | 7 pages | 8 pages (+ Company Data Upload) |
 | **Demo Mode** | Not available | Full synthetic data fallback |
 | **Cloud Deploy** | Not supported | Streamlit Cloud + Aiven MySQL |
 | **Data Import** | CLI only | CLI + interactive file upload |
 | **FX Horizon** | 90 days | Up to 1,095 days (3 years) |
 | **Documentation** | Basic | Production-grade README + guides |
-| **Live Demo** | — | [▶ Launch Dashboard](https://davidmaco-pvis.streamlit.app) |
+| **Live Demo** | Not available | [▶ Launch Dashboard](https://davidmaco-pvis.streamlit.app) |
 
 ---
 
 ## 📐 What Was Prototyped Here
 
-### Phase 1 — Data Foundation
+### Phase 1: Data Foundation
 - MySQL schema design (19 tables: transactional + warehouse)
 - Realistic 3-year data generator with live FX rate integration
 - Star-schema ETL pipeline (dim_date, dim_supplier, dim_material → fact_procurement)
 
-### Phase 2 — Analytics Engine
+### Phase 2: Analytics Engine
 - Monte Carlo FX simulation (Geometric Brownian Motion, 10K paths)
 - Composite supplier risk scoring (5 weighted factors)
 - Cash Conversion Cycle computation (DIO, DPO, CCC)
 
-### Phase 3 — Dashboard
+### Phase 3: Dashboard
 - 7-page Streamlit executive dashboard with Plotly visualizations
 - Live FX rate integration (dual-API failover)
 - Interactive scenario planning and stress testing
 
-### Phase 4 — Data Import
+### Phase 4: Data Import
 - CSV-based external data loader with schema validation
 - Template files for suppliers, materials, purchase orders, PO items
 
-### Phase 5 — Deployment
+### Phase 5: Deployment
 - Docker + docker-compose containerization
 - GitHub Actions CI pipeline
 - Windows PowerShell launcher script
