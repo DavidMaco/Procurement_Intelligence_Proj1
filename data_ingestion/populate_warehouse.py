@@ -216,7 +216,7 @@ def populate_supplier_spend_summary():
     """
     
     fx_df = pd.read_sql(fx_query, engine)
-    
+
     # Merge and calculate USD spend
     df = df.merge(fx_df, on=['supplier_id', 'year'], how='left')
     df['avg_rate_to_usd'] = df['avg_rate_to_usd'].fillna(1.0)
@@ -291,33 +291,25 @@ def populate_supplier_performance_metrics():
     """
     
     fx_df = pd.read_sql(fx_query, engine)
+
+    geo_query = """
+    SELECT supplier_id, COALESCE(risk_index, 0) AS geographic_risk_index
+    FROM suppliers
+    """
+    geo_df = pd.read_sql(geo_query, engine)
     
     # Merge all metrics
     metrics_df = lead_time_df.merge(quality_df, on='supplier_id', how='left')
     metrics_df = metrics_df.merge(otd_df, on='supplier_id', how='left')
     metrics_df = metrics_df.merge(fx_df, on='supplier_id', how='left')
+    metrics_df = metrics_df.merge(geo_df, on='supplier_id', how='left')
     
     # Fill missing values
     metrics_df['avg_defect_rate'] = metrics_df['avg_defect_rate'].fillna(0)
     metrics_df['on_time_delivery_pct'] = metrics_df['on_time_delivery_pct'].fillna(100)
     metrics_df['fx_exposure_pct'] = metrics_df['fx_exposure_pct'].fillna(0)
     metrics_df['lead_time_stddev'] = metrics_df['lead_time_stddev'].fillna(0)
-    
-    # Normalize metrics for composite risk score
-    metrics_df['norm_lead_time'] = (metrics_df['avg_lead_time'] - metrics_df['avg_lead_time'].min()) / \
-                                    (metrics_df['avg_lead_time'].max() - metrics_df['avg_lead_time'].min() + 0.001)
-    
-    metrics_df['norm_defect'] = metrics_df['avg_defect_rate']
-    metrics_df['norm_otd'] = 1 - (metrics_df['on_time_delivery_pct'] / 100)
-    metrics_df['norm_fx'] = metrics_df['fx_exposure_pct'] / 100
-    
-    # Calculate composite risk score (weighted average)
-    metrics_df['composite_risk_score'] = (
-        0.30 * metrics_df['norm_lead_time'] +
-        0.35 * metrics_df['norm_defect'] +
-        0.25 * metrics_df['norm_otd'] +
-        0.10 * metrics_df['norm_fx']
-    ) * 100
+    metrics_df['geographic_risk_index'] = metrics_df['geographic_risk_index'].fillna(0)
     
     # Calculate cost variance (simplified - stddev of unit prices)
     cost_query = """
@@ -332,6 +324,26 @@ def populate_supplier_performance_metrics():
     cost_df = pd.read_sql(cost_query, engine)
     metrics_df = metrics_df.merge(cost_df, on='supplier_id', how='left')
     metrics_df['cost_variance_pct'] = metrics_df['cost_variance_pct'].fillna(0)
+
+    # Normalize metrics for composite risk score
+    metrics_df['norm_lead_time'] = (metrics_df['avg_lead_time'] - metrics_df['avg_lead_time'].min()) / \
+                                    (metrics_df['avg_lead_time'].max() - metrics_df['avg_lead_time'].min() + 0.001)
+
+    metrics_df['norm_defect'] = metrics_df['avg_defect_rate']
+    metrics_df['norm_otd'] = 1 - (metrics_df['on_time_delivery_pct'] / 100)
+    metrics_df['norm_variance'] = metrics_df['cost_variance_pct'] / 100
+    metrics_df['norm_fx'] = metrics_df['fx_exposure_pct'] / 100
+    metrics_df['norm_geo'] = metrics_df['geographic_risk_index'] / 100
+
+    # Calculate composite risk score (weighted average)
+    metrics_df['composite_risk_score'] = (
+        0.22 * metrics_df['norm_otd'] +
+        0.20 * metrics_df['norm_defect'] +
+        0.18 * metrics_df['norm_variance'] +
+        0.18 * metrics_df['norm_lead_time'] +
+        0.12 * metrics_df['norm_fx'] +
+        0.10 * metrics_df['norm_geo']
+    ) * 100
     
     # Prepare final data
     final_data = metrics_df[[

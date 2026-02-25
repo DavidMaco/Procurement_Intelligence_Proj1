@@ -87,6 +87,103 @@ def run_query(query: str, params=None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator) / float(denominator) if denominator not in (0, None) else 0.0
+
+
+def detect_volatility_regimes(log_returns: pd.Series, window: int = 20) -> dict:
+    clean = pd.Series(log_returns).dropna().astype(float)
+    if clean.empty:
+        return {
+            "p_low": 0.5,
+            "p_high": 0.5,
+            "mu_low": 0.0,
+            "sigma_low": 1e-6,
+            "mu_high": 0.0,
+            "sigma_high": 1e-6,
+        }
+
+    rolling_vol = clean.rolling(window=window).std().dropna()
+    if rolling_vol.empty:
+        mu = float(clean.mean())
+        sigma = float(clean.std()) if float(clean.std()) > 0 else 1e-6
+        return {
+            "p_low": 0.5,
+            "p_high": 0.5,
+            "mu_low": mu,
+            "sigma_low": sigma,
+            "mu_high": mu,
+            "sigma_high": sigma,
+        }
+
+    threshold = float(rolling_vol.median())
+    aligned = clean.loc[rolling_vol.index]
+    high_mask = rolling_vol > threshold
+
+    low_returns = aligned[~high_mask]
+    high_returns = aligned[high_mask]
+    if low_returns.empty:
+        low_returns = aligned
+    if high_returns.empty:
+        high_returns = aligned
+
+    mu_low = float(low_returns.mean())
+    sigma_low = float(low_returns.std()) if float(low_returns.std()) > 0 else 1e-6
+    mu_high = float(high_returns.mean())
+    sigma_high = float(high_returns.std()) if float(high_returns.std()) > 0 else 1e-6
+    p_high = float(high_mask.mean())
+
+    return {
+        "p_low": 1.0 - p_high,
+        "p_high": p_high,
+        "mu_low": mu_low,
+        "sigma_low": sigma_low,
+        "mu_high": mu_high,
+        "sigma_high": sigma_high,
+    }
+
+
+def simulate_regime_weighted_paths(current_rate: float, days: int, simulations: int, regime: dict, seed: int = 42):
+    dt = 1 / 252
+    rng = np.random.default_rng(seed)
+    paths = np.zeros((simulations, days), dtype=float)
+
+    for i in range(simulations):
+        rate = float(current_rate)
+        for d in range(days):
+            if rng.random() < regime["p_high"]:
+                shock = rng.normal(regime["mu_high"] * dt, regime["sigma_high"] * np.sqrt(dt))
+            else:
+                shock = rng.normal(regime["mu_low"] * dt, regime["sigma_low"] * np.sqrt(dt))
+            rate *= np.exp(shock)
+            paths[i, d] = rate
+    return paths
+
+
+def build_working_capital_scenarios(dio: float, dpo: float, ccc: float) -> pd.DataFrame:
+    dso = ccc - dio + dpo
+    scenarios = [
+        {"Scenario": "Base", "DIO Δ%": 0, "DPO Δ%": 0, "DSO Δ%": 0},
+        {"Scenario": "Stress", "DIO Δ%": 15, "DPO Δ%": -10, "DSO Δ%": 10},
+        {"Scenario": "Optimized", "DIO Δ%": -10, "DPO Δ%": 10, "DSO Δ%": -5},
+    ]
+    rows = []
+    for s in scenarios:
+        dio_s = dio * (1 + s["DIO Δ%"] / 100)
+        dpo_s = dpo * (1 + s["DPO Δ%"] / 100)
+        dso_s = dso * (1 + s["DSO Δ%"] / 100)
+        ccc_s = dio_s + dso_s - dpo_s
+        rows.append({
+            "Scenario": s["Scenario"],
+            "DIO": dio_s,
+            "DPO": dpo_s,
+            "DSO": dso_s,
+            "CCC": ccc_s,
+            "CCC vs Base": ccc_s - ccc,
+        })
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=300)  # refresh every 5 minutes
 def _fetch_live_rates() -> dict:
     """
@@ -205,7 +302,7 @@ if page == "🏠 Executive Summary":
     )
 
     # ── KPI row ──────────────────────────────────────────────────────────────
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     # Total spend
     spend_df = run_query(
@@ -237,6 +334,54 @@ if page == "🏠 Executive Summary":
     )
     ccc_val = float(ccc_df.iloc[0]["ccc"] or 0) if not ccc_df.empty else 0
 
+    # Procurement Cost Volatility Index (monthly spend volatility / mean)
+    pcvi_df = run_query("""
+        SELECT
+            DATE_FORMAT(d.full_date, '%Y-%m') AS month,
+            SUM(f.total_usd_value) AS spend_usd
+        FROM fact_procurement f
+        JOIN dim_date d ON f.date_key = d.date_key
+        GROUP BY DATE_FORMAT(d.full_date, '%Y-%m')
+        ORDER BY month
+    """)
+    if len(pcvi_df) > 1:
+        monthly_std = float(pcvi_df["spend_usd"].std())
+        monthly_mean = float(pcvi_df["spend_usd"].mean())
+        pcvi = _safe_div(monthly_std, monthly_mean) * 100
+    else:
+        pcvi = 0.0
+
+    # Working Capital Forecast (simple trend on historical CCC)
+    wc_hist_df = run_query("SELECT kpi_date, ccc FROM financial_kpis ORDER BY kpi_date")
+    wc_forecast = ccc_val
+    if len(wc_hist_df) >= 3:
+        y = wc_hist_df["ccc"].astype(float).values
+        x = np.arange(len(y))
+        slope, intercept = np.polyfit(x, y, 1)
+        wc_forecast = float(intercept + slope * (len(y) + 3))
+
+    # Scenario comparison (Base vs Stress +20%)
+    scenario_base_df = run_query("""
+        SELECT
+            SUM((poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)) AS spend_usd,
+            SUM(CASE WHEN cur.currency_code != 'USD'
+                THEN (poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)
+                ELSE 0 END) AS non_usd_spend
+        FROM purchase_orders po
+        JOIN purchase_order_items poi ON po.po_id = poi.po_id
+        JOIN currencies cur ON po.currency_id = cur.currency_id
+        LEFT JOIN fx_rates fx ON po.currency_id = fx.currency_id
+            AND fx.rate_date = (
+                SELECT MAX(rate_date) FROM fx_rates f2
+                WHERE f2.currency_id = po.currency_id AND f2.rate_date <= po.order_date)
+    """)
+    stress_delta = 0.0
+    if not scenario_base_df.empty and scenario_base_df.iloc[0]["spend_usd"]:
+        base_total = float(scenario_base_df.iloc[0]["spend_usd"])
+        non_usd = float(scenario_base_df.iloc[0]["non_usd_spend"] or 0)
+        stress_total = (base_total - non_usd) + non_usd * 1.2
+        stress_delta = stress_total - base_total
+
     # Current NGN rate — live API with DB fallback
     ngn_rate = _fetch_live_ngn_rate()
 
@@ -245,6 +390,11 @@ if page == "🏠 Executive Summary":
     col3.metric("Avg Risk Score", f"{avg_risk:.1f}")
     col4.metric("CCC (days)", f"{ccc_val:,.0f}")
     col5.metric("USD/NGN (live)", f"₦{ngn_rate:,.2f}")
+    col6.metric("Cost Volatility Index", f"{pcvi:.1f}%")
+
+    f1, f2 = st.columns(2)
+    f1.metric("Working Capital Forecast (CCC +3m)", f"{wc_forecast:,.1f} days")
+    f2.metric("Scenario Delta (Stress +20%)", f"${stress_delta:,.0f}")
 
     st.divider()
 
@@ -293,6 +443,33 @@ if page == "🏠 Executive Summary":
             )
             fig.update_layout(height=400)
             st.plotly_chart(fig, width='stretch')
+
+    st.subheader("Supplier Risk Heatmap")
+    heat_df = run_query("""
+        SELECT s.supplier_name,
+               spm.avg_lead_time, spm.avg_defect_rate,
+               spm.cost_variance_pct, spm.on_time_delivery_pct,
+               spm.fx_exposure_pct, spm.composite_risk_score
+        FROM supplier_performance_metrics spm
+        JOIN suppliers s ON spm.supplier_id = s.supplier_id
+        ORDER BY spm.composite_risk_score DESC
+    """)
+    if not heat_df.empty:
+        heat_metrics = [
+            "avg_lead_time", "avg_defect_rate", "cost_variance_pct",
+            "on_time_delivery_pct", "fx_exposure_pct", "composite_risk_score",
+        ]
+        z = heat_df.set_index("supplier_name")[heat_metrics]
+        z_norm = (z - z.min()) / (z.max() - z.min() + 1e-9)
+        fig = px.imshow(
+            z_norm.values,
+            y=z_norm.index.tolist(),
+            x=["Lead Time", "Defect %", "Cost Var %", "OTD %", "FX Exp %", "Composite"],
+            color_continuous_scale="YlOrRd",
+            aspect="auto",
+        )
+        fig.update_layout(height=max(320, len(z_norm) * 42))
+        st.plotly_chart(fig, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -388,30 +565,31 @@ elif page == "📈 FX Volatility & Monte Carlo":
     if st.button("🎲 Run Monte Carlo Simulation", type="primary"):
         hist_df["log_return"] = np.log(hist_df["rate_to_usd"] / hist_df["rate_to_usd"].shift(1))
         hist_df = hist_df.dropna()
-        mu = hist_df["log_return"].mean()
-        sigma = hist_df["log_return"].std()
-        # current_rate already set above from live API (preferred) or DB
-
-        dt = 1 / 252
-        np.random.seed(42)
-        paths = np.zeros((sim_count, sim_days))
-        for i in range(sim_count):
-            rate = current_rate
-            for d in range(sim_days):
-                shock = np.random.normal(mu * dt, sigma * np.sqrt(dt))
-                rate *= np.exp(shock)
-                paths[i, d] = rate
+        regime = detect_volatility_regimes(hist_df["log_return"])
+        paths = simulate_regime_weighted_paths(
+            current_rate=current_rate,
+            days=sim_days,
+            simulations=sim_count,
+            regime=regime,
+            seed=42,
+        )
 
         p5 = np.percentile(paths, 5, axis=0)
         p50 = np.percentile(paths, 50, axis=0)
         p95 = np.percentile(paths, 95, axis=0)
 
         # Summary metrics
-        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+        mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
         mcol1.metric(f"Current Rate ({current_rate_source})", f"{current_rate:,.4f}")
         mcol2.metric("P5 (worst)", f"{p5[-1]:,.4f}")
         mcol3.metric("P50 (median)", f"{p50[-1]:,.4f}")
         mcol4.metric("P95 (best)", f"{p95[-1]:,.4f}")
+        mcol5.metric("High-Vol Regime Weight", f"{regime['p_high']:.1%}")
+
+        st.caption(
+            f"Regime detection: low-vol μ={regime['mu_low']:.6f}, σ={regime['sigma_low']:.6f}; "
+            f"high-vol μ={regime['mu_high']:.6f}, σ={regime['sigma_high']:.6f}."
+        )
 
         # Fan chart
         st.subheader("90-Day FX Forecast Band")
@@ -442,6 +620,57 @@ elif page == "📈 FX Volatility & Monte Carlo":
         fig_dist.add_vline(x=np.percentile(final_rates, 95), line_dash="dash", line_color="green", annotation_text="P95")
         fig_dist.update_layout(height=350)
         st.plotly_chart(fig_dist, width='stretch')
+
+        # VaR on FX-exposed spend
+        exposure_df = run_query("""
+            SELECT
+                SUM((poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)) AS total_spend_usd,
+                SUM(CASE WHEN cur.currency_code != 'USD'
+                    THEN (poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)
+                    ELSE 0 END) AS non_usd_spend
+            FROM purchase_orders po
+            JOIN purchase_order_items poi ON po.po_id = poi.po_id
+            JOIN currencies cur ON po.currency_id = cur.currency_id
+            LEFT JOIN fx_rates fx ON po.currency_id = fx.currency_id
+                AND fx.rate_date = (
+                    SELECT MAX(rate_date) FROM fx_rates f2
+                    WHERE f2.currency_id = po.currency_id AND f2.rate_date <= po.order_date)
+        """)
+
+        if not exposure_df.empty and exposure_df.iloc[0]["non_usd_spend"]:
+            non_usd_spend = float(exposure_df.iloc[0]["non_usd_spend"] or 0)
+            terminal_change = (final_rates / current_rate) - 1.0
+            pnl = non_usd_spend * terminal_change
+            var95 = np.percentile(pnl, 5)
+            cvar95 = pnl[pnl <= var95].mean() if np.any(pnl <= var95) else var95
+
+            st.subheader("Value-at-Risk (FX Exposure)")
+            v1, v2 = st.columns(2)
+            v1.metric("VaR 95% (1-tail)", f"${abs(var95):,.0f}")
+            v2.metric("CVaR 95%", f"${abs(cvar95):,.0f}")
+
+        # Explicit FX Shock Sensitivity table (±10%, ±20%)
+        st.subheader("FX Shock Sensitivity (±10%, ±20%)")
+        sensitivity_rows = []
+        for shock in [-20, -10, 10, 20]:
+            shocked_rate = current_rate * (1 + shock / 100)
+            rate_change = shocked_rate / current_rate - 1
+            sensitivity_rows.append(
+                {
+                    "Shock %": shock,
+                    f"{chosen_code} Rate": shocked_rate,
+                    "Rate Change %": rate_change * 100,
+                }
+            )
+        sensitivity_df = pd.DataFrame(sensitivity_rows)
+        st.dataframe(
+            sensitivity_df.style.format({
+                f"{chosen_code} Rate": "{:,.4f}",
+                "Rate Change %": "{:+.1f}%",
+            }),
+            width='stretch',
+            hide_index=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -539,6 +768,83 @@ elif page == "🏭 Supplier Risk Analysis":
     fig_lt.update_yaxes(title_text="Std Dev (days)", secondary_y=False)
     fig_lt.update_yaxes(title_text="Avg Lead Time (days)", secondary_y=True)
     st.plotly_chart(fig_lt, width='stretch')
+
+    trend_left, trend_right = st.columns(2)
+
+    with trend_left:
+        st.subheader("Lead Time Trend")
+        lt_trend_df = run_query("""
+            SELECT
+                DATE_FORMAT(order_date, '%Y-%m') AS month,
+                AVG(DATEDIFF(delivery_date, order_date)) AS avg_lead_time
+            FROM purchase_orders
+            WHERE delivery_date IS NOT NULL
+            GROUP BY DATE_FORMAT(order_date, '%Y-%m')
+            ORDER BY month
+        """)
+        if not lt_trend_df.empty:
+            fig = px.line(
+                lt_trend_df,
+                x="month",
+                y="avg_lead_time",
+                markers=True,
+                labels={"avg_lead_time": "Avg Lead Time (days)", "month": "Month"},
+            )
+            fig.update_layout(height=330)
+            st.plotly_chart(fig, width='stretch')
+
+    with trend_right:
+        st.subheader("Cost Volatility Trend")
+        cv_trend_df = run_query("""
+            SELECT
+                DATE_FORMAT(po.order_date, '%Y-%m') AS month,
+                STDDEV(poi.unit_price) AS cost_volatility
+            FROM purchase_orders po
+            JOIN purchase_order_items poi ON po.po_id = poi.po_id
+            GROUP BY DATE_FORMAT(po.order_date, '%Y-%m')
+            ORDER BY month
+        """)
+        if not cv_trend_df.empty:
+            fig = px.line(
+                cv_trend_df,
+                x="month",
+                y="cost_volatility",
+                markers=True,
+                labels={"cost_volatility": "Std Dev of Unit Price", "month": "Month"},
+            )
+            fig.update_layout(height=330)
+            st.plotly_chart(fig, width='stretch')
+
+    st.subheader("Country Risk Exposure Map")
+    country_risk_df = run_query("""
+        SELECT
+            c.country_name,
+            AVG(s.risk_index) AS geographic_risk_index,
+            SUM((poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)) AS exposure_usd
+        FROM suppliers s
+        JOIN countries c ON s.country_id = c.country_id
+        JOIN purchase_orders po ON po.supplier_id = s.supplier_id
+        JOIN purchase_order_items poi ON po.po_id = poi.po_id
+        LEFT JOIN fx_rates fx ON po.currency_id = fx.currency_id
+            AND fx.rate_date = (
+                SELECT MAX(rate_date) FROM fx_rates f2
+                WHERE f2.currency_id = po.currency_id AND f2.rate_date <= po.order_date
+            )
+        GROUP BY c.country_name
+        ORDER BY exposure_usd DESC
+    """)
+    if not country_risk_df.empty:
+        fig = px.choropleth(
+            country_risk_df,
+            locations="country_name",
+            locationmode="country names",
+            color="geographic_risk_index",
+            hover_data={"exposure_usd": ":,.0f", "geographic_risk_index": ":.2f"},
+            color_continuous_scale="OrRd",
+            title="Geographic Risk Index by Country",
+        )
+        fig.update_layout(height=420)
+        st.plotly_chart(fig, width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -681,6 +987,44 @@ elif page == "🏦 Working Capital":
             f"Potential CCC improvement: **{improvement:,.0f} days**"
         )
 
+        # Inventory turnover KPI
+        spend_df = run_query("SELECT SUM(total_usd_value) AS total_spend FROM fact_procurement")
+        total_spend = float(spend_df.iloc[0]["total_spend"] or 0) if not spend_df.empty else 0
+        annual_spend = total_spend / 3 if total_spend > 0 else 0
+        avg_inventory = float(inv_df["total_inv"].mean()) if not inv_df.empty else 0
+        inventory_turnover = _safe_div(annual_spend, avg_inventory)
+        st.metric("Inventory Turnover (annualized)", f"{inventory_turnover:,.2f}x")
+
+        # Working capital stress simulation (CCC)
+        st.subheader("Cash Conversion Cycle Simulation")
+        wc_scenarios = build_working_capital_scenarios(
+            dio=float(row["dio"]),
+            dpo=float(row["dpo"]),
+            ccc=float(row["ccc"]),
+        )
+        fig = px.bar(
+            wc_scenarios,
+            x="Scenario",
+            y="CCC",
+            color="CCC",
+            color_continuous_scale="RdYlGn_r",
+            labels={"CCC": "Cash Conversion Cycle (days)"},
+        )
+        fig.update_layout(height=320)
+        st.plotly_chart(fig, width='stretch')
+
+        st.dataframe(
+            wc_scenarios.style.format({
+                "DIO": "{:.1f}",
+                "DPO": "{:.1f}",
+                "DSO": "{:.1f}",
+                "CCC": "{:.1f}",
+                "CCC vs Base": "{:+.1f}",
+            }),
+            width='stretch',
+            hide_index=True,
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 6 — Scenario Planning
@@ -758,6 +1102,199 @@ elif page == "🔄 Scenario Planning":
             width='stretch',
             hide_index=True,
         )
+
+        st.divider()
+        st.subheader("Landed Cost Model")
+        st.caption("Components: base cost, freight, insurance, duties, FX impact, and payment delay cost")
+
+        assumption_col1, assumption_col2 = st.columns(2)
+        with assumption_col1:
+            insurance_pct = st.slider("Insurance %", 0.0, 5.0, 1.5, 0.1) / 100
+            annual_carry_rate = st.slider("Payment delay financing % (annual)", 0.0, 30.0, 12.0, 0.5) / 100
+        with assumption_col2:
+            freight_scale = st.slider("Freight scaling factor", 0.5, 2.0, 1.0, 0.1)
+            duty_scale = st.slider("Duty scaling factor", 0.5, 2.0, 1.0, 0.1)
+
+        landed_df = run_query("""
+            SELECT
+                s.supplier_name,
+                c.country_name,
+                COALESCE(spm.avg_lead_time, s.lead_time_days) AS lead_time_days,
+                COALESCE(spm.fx_exposure_pct, 0) AS fx_exposure_pct,
+                COALESCE(s.risk_index, 0) AS geographic_risk_index,
+                SUM((poi.quantity * poi.unit_price) / COALESCE(fx.rate_to_usd, 1)) AS base_cost_usd
+            FROM suppliers s
+            JOIN countries c ON s.country_id = c.country_id
+            JOIN purchase_orders po ON po.supplier_id = s.supplier_id
+            JOIN purchase_order_items poi ON poi.po_id = po.po_id
+            LEFT JOIN supplier_performance_metrics spm ON spm.supplier_id = s.supplier_id
+            LEFT JOIN fx_rates fx ON po.currency_id = fx.currency_id
+                AND fx.rate_date = (
+                    SELECT MAX(rate_date) FROM fx_rates f2
+                    WHERE f2.currency_id = po.currency_id AND f2.rate_date <= po.order_date
+                )
+            GROUP BY s.supplier_name, c.country_name, COALESCE(spm.avg_lead_time, s.lead_time_days),
+                     COALESCE(spm.fx_exposure_pct, 0), COALESCE(s.risk_index, 0)
+            ORDER BY base_cost_usd DESC
+        """)
+
+        if not landed_df.empty:
+            freight_by_country = {
+                "Nigeria": 0.08,
+                "Germany": 0.05,
+                "China": 0.10,
+                "India": 0.09,
+                "United States": 0.04,
+                "United Kingdom": 0.05,
+                "Brazil": 0.09,
+                "South Africa": 0.08,
+            }
+            duty_by_country = {
+                "Nigeria": 0.06,
+                "Germany": 0.04,
+                "China": 0.08,
+                "India": 0.07,
+                "United States": 0.03,
+                "United Kingdom": 0.03,
+                "Brazil": 0.06,
+                "South Africa": 0.05,
+            }
+
+            landed_df["freight_usd"] = landed_df.apply(
+                lambda r: r["base_cost_usd"] * freight_by_country.get(r["country_name"], 0.06) * freight_scale,
+                axis=1,
+            )
+            landed_df["insurance_usd"] = landed_df["base_cost_usd"] * insurance_pct
+            landed_df["duties_usd"] = landed_df.apply(
+                lambda r: r["base_cost_usd"] * duty_by_country.get(r["country_name"], 0.05) * duty_scale,
+                axis=1,
+            )
+            landed_df["fx_impact_usd"] = landed_df["base_cost_usd"] * (landed_df["fx_exposure_pct"] / 100) * (shock_pct / 100)
+            landed_df["payment_delay_cost_usd"] = (
+                landed_df["base_cost_usd"] * annual_carry_rate * (landed_df["lead_time_days"] / 365)
+            )
+            landed_df["landed_cost_usd"] = (
+                landed_df["base_cost_usd"]
+                + landed_df["freight_usd"]
+                + landed_df["insurance_usd"]
+                + landed_df["duties_usd"]
+                + landed_df["fx_impact_usd"]
+                + landed_df["payment_delay_cost_usd"]
+            )
+
+            component_totals = pd.DataFrame([
+                {"Component": "Base Cost", "USD": landed_df["base_cost_usd"].sum()},
+                {"Component": "Freight", "USD": landed_df["freight_usd"].sum()},
+                {"Component": "Insurance", "USD": landed_df["insurance_usd"].sum()},
+                {"Component": "Duties", "USD": landed_df["duties_usd"].sum()},
+                {"Component": "FX Impact", "USD": landed_df["fx_impact_usd"].sum()},
+                {"Component": "Payment Delay Cost", "USD": landed_df["payment_delay_cost_usd"].sum()},
+            ])
+
+            fig = px.bar(
+                component_totals,
+                x="Component",
+                y="USD",
+                color="USD",
+                color_continuous_scale="Blues",
+                labels={"USD": "Total USD"},
+            )
+            fig.update_layout(height=340)
+            st.plotly_chart(fig, width='stretch')
+
+            st.dataframe(
+                landed_df[[
+                    "supplier_name", "country_name", "base_cost_usd", "freight_usd", "insurance_usd",
+                    "duties_usd", "fx_impact_usd", "payment_delay_cost_usd", "landed_cost_usd",
+                ]].style.format({
+                    "base_cost_usd": "${:,.0f}",
+                    "freight_usd": "${:,.0f}",
+                    "insurance_usd": "${:,.0f}",
+                    "duties_usd": "${:,.0f}",
+                    "fx_impact_usd": "${:,.0f}",
+                    "payment_delay_cost_usd": "${:,.0f}",
+                    "landed_cost_usd": "${:,.0f}",
+                }),
+                width='stretch',
+                hide_index=True,
+            )
+
+            # Procurement Volatility Audit deliverables
+            st.divider()
+            st.subheader("Procurement Volatility Audit")
+
+            fx_exposure_analysis = pd.DataFrame([
+                {
+                    "Metric": "FX Exposure % of Spend",
+                    "Value": f"{(base_non_usd / base_total * 100) if base_total else 0:.1f}%",
+                },
+                {
+                    "Metric": "Stress +20% Impact",
+                    "Value": f"${scenario_df.loc[scenario_df['Scenario'].str.contains('Severe'), 'Impact USD'].iloc[0]:,.0f}",
+                },
+            ])
+
+            supplier_risk_assessment = run_query("""
+                SELECT s.supplier_name, spm.composite_risk_score, spm.on_time_delivery_pct,
+                       spm.avg_defect_rate, spm.cost_variance_pct, spm.fx_exposure_pct
+                FROM supplier_performance_metrics spm
+                JOIN suppliers s ON s.supplier_id = spm.supplier_id
+                ORDER BY spm.composite_risk_score DESC
+                LIMIT 10
+            """)
+
+            wc_df = run_query("SELECT dio, dpo, ccc FROM financial_kpis ORDER BY kpi_date DESC LIMIT 1")
+            if not wc_df.empty:
+                wc_base = wc_df.iloc[0]
+                wc_stress = build_working_capital_scenarios(float(wc_base["dio"]), float(wc_base["dpo"]), float(wc_base["ccc"]))
+            else:
+                wc_stress = pd.DataFrame()
+
+            optimization_reco = pd.DataFrame([
+                {"Recommendation": "Increase hedge coverage for non-USD supplier contracts", "Priority": "High"},
+                {"Recommendation": "Negotiate freight corridors for high-cost geographies", "Priority": "High"},
+                {"Recommendation": "Apply duty optimization and bonded-warehouse routing", "Priority": "Medium"},
+                {"Recommendation": "Tie payment terms to supplier risk and OTD performance", "Priority": "Medium"},
+                {"Recommendation": "Set monthly trigger alerts for cost volatility and lead-time spikes", "Priority": "High"},
+            ])
+
+            a1, a2 = st.columns(2)
+            with a1:
+                st.markdown("**FX exposure analysis**")
+                st.dataframe(fx_exposure_analysis, width='stretch', hide_index=True)
+                st.markdown("**Landed cost breakdown**")
+                st.dataframe(component_totals.style.format({"USD": "${:,.0f}"}), width='stretch', hide_index=True)
+            with a2:
+                st.markdown("**Cost optimization recommendations**")
+                st.dataframe(optimization_reco, width='stretch', hide_index=True)
+
+            st.markdown("**Supplier risk assessment**")
+            if not supplier_risk_assessment.empty:
+                st.dataframe(
+                    supplier_risk_assessment.style.format({
+                        "composite_risk_score": "{:.2f}",
+                        "on_time_delivery_pct": "{:.1f}%",
+                        "avg_defect_rate": "{:.2f}%",
+                        "cost_variance_pct": "{:.2f}%",
+                        "fx_exposure_pct": "{:.1f}%",
+                    }),
+                    width='stretch',
+                    hide_index=True,
+                )
+
+            st.markdown("**Working capital stress test**")
+            if not wc_stress.empty:
+                st.dataframe(
+                    wc_stress.style.format({
+                        "DIO": "{:.1f}",
+                        "DPO": "{:.1f}",
+                        "DSO": "{:.1f}",
+                        "CCC": "{:.1f}",
+                        "CCC vs Base": "{:+.1f}",
+                    }),
+                    width='stretch',
+                    hide_index=True,
+                )
 
     # ── Negotiation insights ─────────────────────────────────────────────────
     st.divider()

@@ -20,6 +20,97 @@ engine = create_engine(
 # 2. FX MONTE CARLO MODULE
 # =========================
 
+def detect_volatility_regimes(log_returns: pd.Series, window: int = 20) -> dict:
+    """
+    Split return history into low-vol and high-vol regimes, then estimate
+    regime-specific drift and volatility and regime probabilities.
+    """
+    clean = pd.Series(log_returns).dropna().astype(float)
+    if clean.empty:
+        raise ValueError("No valid returns available for regime detection")
+
+    rolling_vol = clean.rolling(window=window).std().dropna()
+    if rolling_vol.empty:
+        mu = float(clean.mean())
+        sigma = float(clean.std())
+        sigma = sigma if sigma > 0 else 1e-6
+        return {
+            "window": window,
+            "threshold": sigma,
+            "p_low": 0.5,
+            "p_high": 0.5,
+            "mu_low": mu,
+            "sigma_low": sigma,
+            "mu_high": mu,
+            "sigma_high": sigma,
+        }
+
+    threshold = float(rolling_vol.median())
+    aligned_returns = clean.loc[rolling_vol.index]
+    high_mask = rolling_vol > threshold
+
+    low_returns = aligned_returns[~high_mask]
+    high_returns = aligned_returns[high_mask]
+
+    if low_returns.empty:
+        low_returns = aligned_returns
+    if high_returns.empty:
+        high_returns = aligned_returns
+
+    mu_low = float(low_returns.mean())
+    sigma_low = float(low_returns.std())
+    mu_high = float(high_returns.mean())
+    sigma_high = float(high_returns.std())
+
+    sigma_low = sigma_low if sigma_low > 0 else 1e-6
+    sigma_high = sigma_high if sigma_high > 0 else 1e-6
+
+    p_high = float(high_mask.mean())
+    p_low = 1.0 - p_high
+
+    return {
+        "window": window,
+        "threshold": threshold,
+        "p_low": p_low,
+        "p_high": p_high,
+        "mu_low": mu_low,
+        "sigma_low": sigma_low,
+        "mu_high": mu_high,
+        "sigma_high": sigma_high,
+    }
+
+
+def simulate_regime_weighted_paths(
+    current_rate: float,
+    days: int,
+    simulations: int,
+    regime_stats: dict,
+    seed: int = 42,
+):
+    """Simulate FX paths using weighted low/high volatility regime probabilities."""
+    dt = 1 / 252
+    rng = np.random.default_rng(seed)
+
+    p_high = regime_stats["p_high"]
+    mu_low = regime_stats["mu_low"]
+    sigma_low = regime_stats["sigma_low"]
+    mu_high = regime_stats["mu_high"]
+    sigma_high = regime_stats["sigma_high"]
+
+    paths = np.zeros((simulations, days), dtype=float)
+
+    for i in range(simulations):
+        rate = float(current_rate)
+        for d in range(days):
+            if rng.random() < p_high:
+                shock = rng.normal(mu_high * dt, sigma_high * np.sqrt(dt))
+            else:
+                shock = rng.normal(mu_low * dt, sigma_low * np.sqrt(dt))
+            rate *= np.exp(shock)
+            paths[i, d] = rate
+
+    return paths
+
 def run_fx_simulation(currency_id=3, days=90, simulations=10000):
     """
     Run Monte Carlo simulation for FX rate forecasting.
@@ -53,29 +144,25 @@ def run_fx_simulation(currency_id=3, days=90, simulations=10000):
 
     fx_df = fx_df.dropna()
 
-    # Historical volatility and drift
-    mu = fx_df['log_return'].mean()
-    sigma = fx_df['log_return'].std()
+    # Regime-specific drift and volatility
+    regime_stats = detect_volatility_regimes(fx_df['log_return'])
     current_rate = fx_df['rate_to_usd'].iloc[-1]
 
     print(f"FX Simulation Parameters:")
     print(f"  Currency ID: {currency_id}")
     print(f"  Current Rate: {current_rate:.6f}")
-    print(f"  Historical Drift (μ): {mu:.6f}")
-    print(f"  Historical Volatility (σ): {sigma:.6f}")
+    print(f"  Low-Vol Regime:  μ={regime_stats['mu_low']:.6f}, σ={regime_stats['sigma_low']:.6f}, p={regime_stats['p_low']:.2%}")
+    print(f"  High-Vol Regime: μ={regime_stats['mu_high']:.6f}, σ={regime_stats['sigma_high']:.6f}, p={regime_stats['p_high']:.2%}")
 
-    # Monte Carlo simulation
-    dt = 1/252  # Daily time step (252 trading days)
-    final_rates = []
-
-    np.random.seed(42)  # For reproducibility
-    
-    for _ in range(simulations):
-        rate = current_rate
-        for _ in range(days):
-            shock = np.random.normal(mu*dt, sigma*np.sqrt(dt))
-            rate *= np.exp(shock)
-        final_rates.append(rate)
+    # Regime-weighted Monte Carlo simulation
+    paths = simulate_regime_weighted_paths(
+        current_rate=current_rate,
+        days=days,
+        simulations=simulations,
+        regime_stats=regime_stats,
+        seed=42,
+    )
+    final_rates = paths[:, -1]
 
     # Calculate percentiles
     p5, p50, p95 = np.percentile(final_rates, [5, 50, 95])
@@ -190,11 +277,18 @@ def run_supplier_risk():
 
     fx_df = pd.read_sql(fx_query, engine)
 
+    geo_query = """
+    SELECT supplier_id, COALESCE(risk_index, 0) AS geographic_risk_index
+    FROM suppliers
+    """
+    geo_df = pd.read_sql(geo_query, engine)
+
     # Merge all metrics
     df = lead_df.merge(quality_df, on='supplier_id', how='left')
     df = df.merge(otd_df, on='supplier_id', how='left')
     df = df.merge(cost_df, on='supplier_id', how='left')
     df = df.merge(fx_df, on='supplier_id', how='left')
+    df = df.merge(geo_df, on='supplier_id', how='left')
 
     # Fill nulls with defaults
     df['avg_defect_rate'] = df['avg_defect_rate'].fillna(0)
@@ -202,6 +296,7 @@ def run_supplier_risk():
     df['cost_variance_pct'] = df['cost_variance_pct'].fillna(0)
     df['fx_exposure_pct'] = df['fx_exposure_pct'].fillna(0)
     df['lead_time_stddev'] = df['lead_time_stddev'].fillna(0)
+    df['geographic_risk_index'] = df['geographic_risk_index'].fillna(0)
 
     # Normalize metrics for risk scoring
     df['norm_lead'] = (
@@ -213,14 +308,16 @@ def run_supplier_risk():
     df['norm_otd'] = 1 - (df['on_time_delivery_pct'] / 100)
     df['norm_variance'] = df['cost_variance_pct'] / 100
     df['norm_fx'] = df['fx_exposure_pct'] / 100
+    df['norm_geo'] = df['geographic_risk_index'] / 100
 
     # Composite risk score (weighted)
     df['composite_risk_score'] = (
-        0.25 * df['norm_lead'] +      # Lead time consistency
-        0.30 * df['norm_defect'] +    # Quality issues
-        0.25 * df['norm_otd'] +       # Delivery reliability
-        0.10 * df['norm_variance'] +  # Price stability
-        0.10 * df['norm_fx']          # FX exposure
+        0.22 * df['norm_otd'] +       # On-time delivery
+        0.20 * df['norm_defect'] +    # Quality defect rate
+        0.18 * df['norm_variance'] +  # Cost variance
+        0.18 * df['norm_fx'] +        # FX sensitivity
+        0.12 * df['norm_lead'] +      # Lead time consistency
+        0.10 * df['norm_geo']         # Geographic risk index
     ) * 100
 
     # Add timestamp
