@@ -45,8 +45,8 @@ Manufacturing procurement teams face three critical blind spots:
 
 | Blind Spot | Business Impact | PVIS Solution |
 |:---|:---|:---|
-| **FX Volatility** | A 15% NGN devaluation can wipe out ₦180M+ in margin on a single quarter | Monte Carlo simulation (10K-50K paths) with live API rates, P5/P50/P95 forecast bands |
-| **Supplier Risk** | Late deliveries and defects cascade into production stoppages | Composite risk scoring (5 weighted factors) with automated negotiation playbooks |
+| **FX Volatility** | A 15% NGN devaluation can wipe out ₦180M+ in margin on a single quarter | Regime-weighted Monte Carlo simulation (10K-50K paths) with live API rates, P5/P50/P95 bands, and VaR/CVaR |
+| **Supplier Risk** | Late deliveries and defects cascade into production stoppages | Composite risk scoring (6 weighted factors including geographic risk index) with automated negotiation playbooks |
 | **Cash Leakage** | Cost variances against standard costs go undetected across 1,000+ PO lines | Spend decomposition by supplier × category × year with leakage attribution |
 
 PVIS turns raw procurement data into **actionable intelligence**. It provides specific recommendations on which contracts to renegotiate, where to hedge FX exposure, and how to optimize the cash conversion cycle.
@@ -56,11 +56,12 @@ PVIS turns raw procurement data into **actionable intelligence**. It provides sp
 ## ✨ Key Features
 
 ### Analytics Engine
-- **Monte Carlo FX Simulation:** Geometric Brownian Motion with 10K-50K paths over up to 1,095 trading days (3 years), seeded from live exchange rates
-- **Composite Supplier Risk Scoring:** Weighted model: 30% lead time volatility + 35% defect rate + 25% on-time delivery + 10% FX exposure
+- **Regime-Weighted Monte Carlo FX Simulation:** Low/high volatility regime detection with separate drift and volatility estimates, then weighted-path simulation over up to 1,095 trading days
+- **Composite Supplier Risk Scoring:** Weighted model: on-time delivery, defect rate, cost variance, FX sensitivity, lead-time consistency, and geographic risk index
 - **Cash Conversion Cycle Optimization:** DIO/DPO modeling with target scenario recommendations
+- **Landed Cost Model:** Base cost + freight + insurance + duties + FX impact + payment delay cost
 - **Cost Leakage Detection:** Automated identification of unit-price vs. standard-cost variances by category
-- **FX Stress Testing:** Interactive scenario planner for landed-cost impact across -30% to +50% shock spectrum
+- **FX Stress Testing and Risk Metrics:** Interactive scenario planner, VaR/CVaR, and explicit FX shock sensitivity (±10%, ±20%)
 
 ### Data Platform
 - **Live Exchange Rates:** Dual-API failover (open.er-api.com to frankfurter.dev), 150+ currencies including NGN
@@ -71,9 +72,10 @@ PVIS turns raw procurement data into **actionable intelligence**. It provides sp
 
 ### Dashboard
 - **8 Interactive Pages:** Executive Summary, FX Volatility & Monte Carlo, Supplier Risk Analysis, Spend & Cost Analysis, Working Capital, Scenario Planning, Company Data Upload, Pipeline Runner
-- **Real-Time KPIs:** Live USD/NGN rate, total spend, FX exposure %, average risk score, CCC days
+- **Real-Time KPIs:** Live USD/NGN rate, total spend, FX exposure %, average risk score, CCC days, Procurement Cost Volatility Index, and Working Capital Forecast
 - **Auto-Negotiation Playbooks:** Per-supplier action items generated from risk metrics
 - **Demo Mode:** Full dashboard functionality with synthetic data when no database is connected
+- **Decision Layer for Power BI:** Semantic SQL views for executive KPI cards, supplier risk heatmap, and scenario comparison
 
 ---
 
@@ -121,8 +123,8 @@ PVIS turns raw procurement data into **actionable intelligence**. It provides sp
 │                       ANALYTICS ENGINE                                       │
 │                                                                              │
 │   advanced_analytics.py                                                      │
-│   ├── Monte Carlo FX Simulation  (GBM, configurable paths & horizon)         │
-│   ├── Composite Supplier Risk    (5-factor weighted scoring model)            │
+│   ├── Monte Carlo FX Simulation  (regime-weighted GBM, configurable paths)   │
+│   ├── Composite Supplier Risk    (6-factor weighted scoring model)            │
 │   ├── Spend Aggregation          (supplier × category × year)                │
 │   └── Working Capital KPIs       (DIO, DPO, CCC optimization)               │
 └─────────────────────────────────┬────────────────────────────────────────────┘
@@ -223,22 +225,31 @@ python -m pytest tests/ -v
 ## 📊 Dashboard Pages
 
 ### 1. 🏠 Executive Summary
-Real-time KPI cards (total spend, FX exposure %, avg risk score, CCC days, live USD/NGN rate) with supplier risk ranking bar chart and monthly procurement trend area chart.
+Real-time KPI cards (total spend, FX exposure %, avg risk score, CCC days, live USD/NGN rate, Procurement Cost Volatility Index) plus Working Capital Forecast, scenario delta, supplier risk ranking, monthly trend, and supplier risk heatmap.
 
 ### 2. 📈 FX Volatility & Monte Carlo
-Select any currency, configure horizon (30-1,095 days) and simulations (1K-50K paths). Renders historical rate chart with live rate marker, P5/P50/P95 forecast fan chart, and terminal rate distribution histogram.
+Select any currency, configure horizon (30-1,095 days) and simulations (1K-50K paths). Renders historical rate chart with live marker, regime-weighted P5/P50/P95 fan chart, terminal distribution, VaR/CVaR, and FX shock sensitivity (±10%, ±20%).
 
 ### 3. 🏭 Supplier Risk Analysis
-Normalized risk heatmap across 7 metrics, detailed performance table with conditional formatting, and lead-time volatility dual-axis chart.
+Normalized risk heatmap across core risk metrics, detailed performance table with conditional formatting, lead-time trend, cost-volatility trend, and country risk exposure map.
 
 ### 4. 💰 Spend & Cost Analysis
 Spend donut charts by supplier and category, cost leakage waterfall by material category, annual spend grouped bar chart with year-over-year comparison.
 
 ### 5. 🏦 Working Capital
-Inventory value trend, payables/receivables dual timeline, CCC breakdown (DIO/DPO) with optimization targets and projected savings.
+Inventory value trend, payables/receivables dual timeline, CCC breakdown (DIO/DPO), inventory turnover KPI, and CCC scenario simulation (Base, Stress, Optimized).
 
 ### 6. 🔄 Scenario Planning
-Interactive FX stress test slider (-30% to +50%), multi-scenario comparison table, and per-supplier negotiation action playbooks.
+Interactive FX stress test slider (-30% to +50%), landed cost model component breakdown, procurement volatility audit deliverables, multi-scenario comparison table, and per-supplier negotiation action playbooks.
+
+---
+
+## 📊 Power BI Decision Layer
+
+PVIS now includes a Power BI semantic layer in `powerbi/`:
+
+- `powerbi/pvis_decision_layer.sql`: Creates executive reporting views (`v_pvis_procurement_volatility`, `v_pvis_fx_exposure`, `v_pvis_supplier_risk`, `v_pvis_working_capital`, `v_pvis_scenario_comparison`)
+- `powerbi/PVIS_Dashboard_BUILD.md`: Build guide, visual mapping, and starter DAX measures
 
 ### 7. 📂 Company Data Upload
 Drag-and-drop file uploader for company CSV or ZIP data. It validates, processes, and runs the full analytics pipeline on your own procurement data from the browser.
